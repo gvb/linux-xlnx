@@ -408,8 +408,9 @@ static void zynqmp_qspi_init_hw(struct zynqmp_qspi *xqspi)
 	config_reg &= ~GQSPI_CFG_EN_POLL_TO_MASK;
 	/* Set hold bit */
 	config_reg |= GQSPI_CFG_WP_HOLD_MASK;
-	/* Clear pre-scalar by default */
+	/* Clear pre-scalar by default => max speed */
 	config_reg &= ~GQSPI_CFG_BAUD_RATE_DIV_MASK;
+	xqspi->speed_hz = clk_rate / 2;
 	/* CPHA 0 */
 	config_reg &= ~GQSPI_CFG_CLK_PHA_MASK;
 	/* CPOL 0 */
@@ -421,12 +422,11 @@ static void zynqmp_qspi_init_hw(struct zynqmp_qspi *xqspi)
 			   GQSPI_FIFO_CTRL_RST_RX_FIFO_MASK |
 			   GQSPI_FIFO_CTRL_RST_TX_FIFO_MASK |
 			   GQSPI_FIFO_CTRL_RST_GEN_FIFO_MASK);
-	/* Set by default to allow for high frequencies */
-	while ((baud_rate_val < GQSPI_BAUD_DIV_MAX) &&
-	       (clk_rate /
-		(GQSPI_BAUD_DIV_SHIFT << baud_rate_val)) > xqspi->speed_hz)
-		baud_rate_val++;
+
+	/* Set the tapdelay based on the configured speed */
+	baud_rate_val = (config_reg >> GQSPI_BAUD_DIV_SHIFT) & GQSPI_CFG_BAUD_RATE_DIV_MASK;
 	zynqmp_qspi_set_tapdelay(xqspi, baud_rate_val);
+
 	/* Reset thresholds */
 	zynqmp_gqspi_write(xqspi, GQSPI_TX_THRESHOLD_OFST,
 			   GQSPI_TX_FIFO_THRESHOLD_RESET_VAL);
