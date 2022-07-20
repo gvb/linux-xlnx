@@ -90,7 +90,6 @@ static int xvip_dma_verify_format(struct xvip_dma *dma)
  * Pipeline Stream Management
  */
 
-
 /**
  * xvip_pipeline_set_stream - Enable/disable streaming on a pipeline
  * @pipe: The pipeline
@@ -126,7 +125,7 @@ static int xvip_pipeline_set_stream(struct xvip_pipeline *pipe, bool on)
 	xdev = pipe->xdev;
 
 	if (on) {
-		if (pipe->stream_count == pipe->num_dmas - 1) {
+		if (pipe->stream_count == pipe->num_dmas - 1 || xdev->atomic_streamon) {
 			ret = xvip_graph_pipeline_start_stop(xdev, pipe, true);
 			if (ret < 0)
 				goto done;
@@ -272,7 +271,7 @@ static void xvip_dma_complete(void *param)
 	struct xvip_dma_buffer *buf = param;
 	struct xvip_dma *dma = buf->dma;
 	int i, sizeimage;
-	u32 fid;
+	u32 fid = 0;
 	int status;
 
 	spin_lock(&dma->queued_lock);
@@ -438,14 +437,26 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 					      (pix_mp->height - dma->r.height);
 		} else {
 			/* Handling non-contiguous data with mplanes */
-			if (dma->fmtinfo->buffers == 2) {
+			if (dma->fmtinfo->buffers == 2 || dma->fmtinfo->buffers == 3) {
 				dma_addr_t chroma_addr =
 					vb2_dma_contig_plane_dma_addr(vb, 1);
 				luma_size = bpl * dma->xt.numf;
 				if (chroma_addr > addr)
 					dma->sgl[0].dst_icg = chroma_addr -
-							      addr - luma_size;
-				}
+						addr - luma_size;
+			}
+			/* Handle the 3rd plane for Y_U_V8 */
+			if (dma->fmtinfo->buffers == 3) {
+				dma_addr_t chroma_addr =
+					vb2_dma_contig_plane_dma_addr(vb, 1);
+				dma_addr_t third_plane_addr =
+					vb2_dma_contig_plane_dma_addr(vb, 2);
+				u32 chroma_size = bpl * dma->xt.numf;
+
+				if (third_plane_addr > chroma_addr)
+					dma->sgl[0].dst_icg = third_plane_addr -
+						chroma_addr - chroma_size;
+			}
 		}
 	} else {
 		struct v4l2_pix_format *pix;
@@ -646,7 +657,7 @@ static int xvip_xdma_enum_fmt(struct xvip_dma *dma, struct v4l2_fmtdesc *f,
 {
 	const struct xvip_video_format *fmt;
 	int ret;
-	u32 i, fmt_cnt, *fmts;
+	u32 i, fmt_cnt = 0, *fmts = NULL;
 
 	ret = xilinx_xdma_get_v4l2_vid_fmts(dma->dma, &fmt_cnt, &fmts);
 	if (ret)
@@ -971,7 +982,7 @@ xvip_dma_set_format(struct file *file, void *fh, struct v4l2_format *format)
 {
 	struct v4l2_fh *vfh = file->private_data;
 	struct xvip_dma *dma = to_xvip_dma(vfh->vdev);
-	const struct xvip_video_format *info;
+	const struct xvip_video_format *info = NULL;
 
 	__xvip_dma_try_format(dma, format, &info);
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Xilinx SDI Rx Subsystem
  *
@@ -5,14 +6,6 @@
  *
  * Contacts: Vishal Sagar <vsagar@xilinx.com>
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <dt-bindings/media/xilinx-vip.h>
@@ -347,6 +340,7 @@ struct xsdirxss_core {
  * @edhmask: EDH mask set by control
  * @searchmask: Search mask set by control
  * @streaming: Flag for storing streaming state
+ * @s_stream: Flag for storing streaming state
  * @vidlocked: Flag indicating SDI Rx has locked onto video stream
  * @ts_is_interlaced: Flag indicating Transport Stream is interlaced.
  * @framer_enable: Flag for framer enabled or not set by control
@@ -369,6 +363,7 @@ struct xsdirxss_state {
 	u32 edhmask;
 	u16 searchmask;
 	bool streaming;
+	bool s_stream;
 	bool vidlocked;
 	bool ts_is_interlaced;
 	bool framer_enable;
@@ -874,9 +869,9 @@ static void xsdirx_setedherrcnttrigger(struct xsdirxss_core *core, u32 enable)
 static inline void xsdirx_setvidlockwindow(struct xsdirxss_core *core, u32 val)
 {
 	/*
-	 * The video lock window is the amount of time for which the
-	 * the mode and transport stream should be locked to get the
-	 * video lock interrupt.
+	 * The video lock window is the amount of time for which
+	 * the mode and transport stream should be locked to get
+	 * the video lock interrupt.
 	 */
 	xsdirxss_write(core, XSDIRX_VID_LOCK_WINDOW_REG, val);
 }
@@ -1317,13 +1312,8 @@ static int xsdirx_get_stream_properties(struct xsdirxss_state *state)
 		if (format->height == 1080 && pic_type && !tscan)
 			format->field = V4L2_FIELD_ALTERNATE;
 
-		/*
-		 * In 3GB DL pSF mode the video is similar to interlaced.
-		 * So though it is a progressive video, its transport is
-		 * interlaced and is sent as two width x (height/2) buffers.
-		 */
 		if (byte1 == XST352_BYTE1_ST372_DL_3GB) {
-			if (state->ts_is_interlaced)
+			if (!pic_type)
 				format->field = V4L2_FIELD_ALTERNATE;
 			else
 				format->field = V4L2_FIELD_NONE;
@@ -1510,6 +1500,8 @@ static irqreturn_t xsdirxss_irq_handler(int irq, void *dev_id)
 			u32 mask = XSDIRX_RST_CTRL_RST_CRC_ERRCNT_MASK |
 				   XSDIRX_RST_CTRL_RST_EDH_ERRCNT_MASK;
 
+			u32 prev_payload = state->prev_payload;
+
 			dev_dbg(core->dev, "video lock interrupt\n");
 
 			xsdirxss_set(core, XSDIRX_RST_CTRL_REG, mask);
@@ -1523,9 +1515,25 @@ static irqreturn_t xsdirxss_irq_handler(int irq, void *dev_id)
 
 			if (state->vidlocked) {
 				gen_event = false;
+				/* If it was came here due to interrupt of
+				 * setting gtclk, re-enabling stream control
+				 */
+				if (state->s_stream) {
+					xsdirx_streamflow_control(core, true);
+					state->streaming = true;
+				}
 			} else if (!xsdirx_get_stream_properties(state)) {
 				state->vidlocked = true;
 				xsdirxss_set_gtclk(state);
+				/* If previous payload and current payload are
+				 * same then start streaming. This is not a
+				 * correct way but a workaround
+				 */
+				if (val2 == prev_payload && state->s_stream) {
+					dev_dbg(core->dev, "Resuming as payload is same\n");
+					xsdirx_streamflow_control(core, true);
+					state->streaming = true;
+				}
 			} else {
 				dev_err_ratelimited(core->dev, "Unable to get stream properties!\n");
 				state->vidlocked = false;
@@ -1920,8 +1928,10 @@ static int xsdirxss_s_stream(struct v4l2_subdev *sd, int enable)
 
 		xsdirx_streamflow_control(core, true);
 		xsdirxss->streaming = true;
+		xsdirxss->s_stream = true;
 		dev_dbg(core->dev, "Streaming started\n");
 	} else {
+		xsdirxss->s_stream = false;
 		if (!xsdirxss->streaming) {
 			dev_dbg(core->dev, "Stopped streaming already\n");
 			return 0;
@@ -1961,14 +1971,15 @@ static int xsdirxss_g_input_status(struct v4l2_subdev *sd, u32 *status)
 
 static struct v4l2_mbus_framefmt *
 __xsdirxss_get_pad_format(struct xsdirxss_state *xsdirxss,
-			  struct v4l2_subdev_pad_config *cfg,
+			  struct v4l2_subdev_state *sd_state,
 			  unsigned int pad, u32 which)
 {
 	struct v4l2_mbus_framefmt *format;
 
 	switch (which) {
 	case V4L2_SUBDEV_FORMAT_TRY:
-		format = v4l2_subdev_get_try_format(&xsdirxss->subdev, cfg,
+		format = v4l2_subdev_get_try_format(&xsdirxss->subdev,
+						    sd_state,
 						    pad);
 		break;
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
@@ -1985,7 +1996,7 @@ __xsdirxss_get_pad_format(struct xsdirxss_state *xsdirxss,
 /**
  * xsdirxss_get_format - Get the pad format
  * @sd: Pointer to V4L2 Sub device structure
- * @cfg: Pointer to sub device pad information structure
+ * @sd_state: Pointer to v4l2_subdev_state structure
  * @fmt: Pointer to pad level media bus format
  *
  * This function is used to get the pad format information.
@@ -1993,7 +2004,7 @@ __xsdirxss_get_pad_format(struct xsdirxss_state *xsdirxss,
  * Return: 0 on success
  */
 static int xsdirxss_get_format(struct v4l2_subdev *sd,
-			       struct v4l2_subdev_pad_config *cfg,
+			       struct v4l2_subdev_state *sd_state,
 			       struct v4l2_subdev_format *fmt)
 {
 	struct xsdirxss_state *xsdirxss = to_xsdirxssstate(sd);
@@ -2005,7 +2016,7 @@ static int xsdirxss_get_format(struct v4l2_subdev *sd,
 		return -EINVAL;
 	}
 
-	format = __xsdirxss_get_pad_format(xsdirxss, cfg,
+	format = __xsdirxss_get_pad_format(xsdirxss, sd_state,
 					   fmt->pad, fmt->which);
 	if (!format)
 		return -EINVAL;
@@ -2021,7 +2032,7 @@ static int xsdirxss_get_format(struct v4l2_subdev *sd,
 /**
  * xsdirxss_set_format - This is used to set the pad format
  * @sd: Pointer to V4L2 Sub device structure
- * @cfg: Pointer to sub device pad information structure
+ * @sd_state: Pointer to v4l2_subdev_state structure
  * @fmt: Pointer to pad level media bus format
  *
  * This function is used to set the pad format.
@@ -2031,7 +2042,7 @@ static int xsdirxss_get_format(struct v4l2_subdev *sd,
  * Return: 0 on success
  */
 static int xsdirxss_set_format(struct v4l2_subdev *sd,
-			       struct v4l2_subdev_pad_config *cfg,
+			       struct v4l2_subdev_state *sd_state,
 			       struct v4l2_subdev_format *fmt)
 {
 	struct v4l2_mbus_framefmt *__format;
@@ -2043,7 +2054,7 @@ static int xsdirxss_set_format(struct v4l2_subdev *sd,
 		fmt->format.code, fmt->format.field,
 		fmt->format.colorspace);
 
-	__format = __xsdirxss_get_pad_format(xsdirxss, cfg,
+	__format = __xsdirxss_get_pad_format(xsdirxss, sd_state,
 					     fmt->pad, fmt->which);
 	if (!__format)
 		return -EINVAL;
@@ -2058,13 +2069,13 @@ static int xsdirxss_set_format(struct v4l2_subdev *sd,
 /**
  * xsdirxss_enum_mbus_code - Handle pixel format enumeration
  * @sd: pointer to v4l2 subdev structure
- * @cfg: V4L2 subdev pad configuration
+ * @sd_state: Pointer to v4l2_subdev_state structure
  * @code: pointer to v4l2_subdev_mbus_code_enum structure
  *
  * Return: -EINVAL or zero on success
  */
 static int xsdirxss_enum_mbus_code(struct v4l2_subdev *sd,
-				   struct v4l2_subdev_pad_config *cfg,
+				   struct v4l2_subdev_state *sd_state,
 				   struct v4l2_subdev_mbus_code_enum *code)
 {
 	struct xsdirxss_state *xsdirxss = to_xsdirxssstate(sd);
@@ -2146,7 +2157,7 @@ static int xsdirxss_open(struct v4l2_subdev *sd,
 	struct v4l2_mbus_framefmt *format;
 	struct xsdirxss_state *xsdirxss = to_xsdirxssstate(sd);
 
-	format = v4l2_subdev_get_try_format(sd, fh->pad, 0);
+	format = v4l2_subdev_get_try_format(sd, fh->state, 0);
 	*format = xsdirxss->default_format;
 
 	return 0;
@@ -2620,6 +2631,7 @@ static int xsdirxss_probe(struct platform_device *pdev)
 	}
 
 	xsdirxss->streaming = false;
+	xsdirxss->s_stream = false;
 
 	xsdirx_core_enable(core);
 

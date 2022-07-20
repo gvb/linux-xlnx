@@ -393,7 +393,8 @@ static irqreturn_t xlnx_sdi_irq_handler(int irq, void *data)
 			reg & ~(XSDI_AXI4S_VID_LOCK_INTR));
 
 	reg = xlnx_sdi_readl(sdi->base, XSDI_TX_STS_SB_TDATA);
-	if (reg & XSDI_TX_TDATA_GT_RESETDONE) {
+	if (reg & XSDI_TX_TDATA_GT_RESETDONE ||
+	    !sdi->gt_rst_gpio) {
 		sdi->event_received = true;
 		wake_up_interruptible(&sdi->wait_event);
 	}
@@ -505,7 +506,7 @@ static void xlnx_sdi_payload_config(struct xlnx_sdi *sdi, u32 mode)
  * @sdi:	pointer Xilinx SDI Tx structure
  * @mode:	SDI Tx display mode
  * @is_frac:	0 - integer 1 - fractional
- * @mux_ptrn:	specifiy the data stream interleaving pattern to be used
+ * @mux_ptrn:	specify the data stream interleaving pattern to be used
  * This function config the SDI st352 payload parameter.
  */
 static void xlnx_sdi_set_mode(struct xlnx_sdi *sdi, u32 mode,
@@ -1017,7 +1018,8 @@ static void xlnx_sdi_encoder_atomic_mode_set(struct drm_encoder *encoder,
 		 * datasheet
 		 */
 		mdelay(50);
-		xlnx_sdi_gt_reset(sdi);
+		if (sdi->gt_rst_gpio)
+			xlnx_sdi_gt_reset(sdi);
 	}
 
 	/* Set timing parameters as per bridge output parameters */
@@ -1033,6 +1035,7 @@ static void xlnx_sdi_encoder_atomic_mode_set(struct drm_encoder *encoder,
 			    sdi->width_out_prop_val &&
 			    xlnx_sdi_modes[i].mode.vdisplay ==
 			    sdi->height_out_prop_val &&
+			    adjusted_mode->flags == xlnx_sdi_modes[i].mode.flags &&
 			    drm_mode_vrefresh(&xlnx_sdi_modes[i].mode) ==
 			    drm_mode_vrefresh(adjusted_mode)) {
 				memcpy((char *)adjusted_mode +
